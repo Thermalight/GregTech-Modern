@@ -5,6 +5,7 @@ import com.gregtechceu.gtceu.api.data.chemical.ChemicalHelper;
 import com.gregtechceu.gtceu.api.data.chemical.material.Material;
 import com.gregtechceu.gtceu.api.data.tag.TagPrefix;
 import com.gregtechceu.gtceu.api.gui.widget.SlotWidget;
+import com.gregtechceu.gtceu.api.machine.trait.RecipeHandlerList;
 import com.gregtechceu.gtceu.api.recipe.GTRecipe;
 import com.gregtechceu.gtceu.api.recipe.GTRecipeType;
 import com.gregtechceu.gtceu.api.recipe.ResearchData;
@@ -56,10 +57,8 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.UnknownNullability;
 
 import java.util.*;
-import java.util.function.Function;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 /**
  * @author KilaBash
@@ -242,18 +241,62 @@ public class ItemRecipeCapability extends RecipeCapability<Ingredient> {
     @Override
     public int limitParallel(GTRecipe recipe, IRecipeCapabilityHolder holder, int multiplier) {
         if (holder instanceof ICustomParallel p) return p.limitParallel(recipe, multiplier);
+        if (!holder.hasCapabilityProxies()) return 0;
+
+        var handlers = holder.getCapabilitiesFlat(IO.OUT, ItemRecipeCapability.CAP);
+        if (handlers.isEmpty()) return 0;
+
+        var outputContents = recipe.getOutputContents(ItemRecipeCapability.CAP);
+        if (outputContents.isEmpty()) return multiplier;
 
         int minMultiplier = 0;
         int maxMultiplier = multiplier;
 
+        if (ConfigHolder.INSTANCE.dev.parallelSwitch) {
+            int maxCount = 0;
+            List<Ingredient> ingredients = new ArrayList<>(outputContents.size());
+            for (var content : outputContents) {
+                var ing = ItemRecipeCapability.CAP.of(content.content);
+                int count = 1;
+                if (ing instanceof SizedIngredient sizedIngredient) {
+                    count = sizedIngredient.getAmount();
+                } else if (ing instanceof IntProviderIngredient intProviderIngredient) {
+                    count = intProviderIngredient.getSampledCount(GTValues.RNG);
+                }
+                maxCount = Math.max(maxCount, count);
+                ingredients.add(ing);
+            }
+
+            if (maxCount != 0 && multiplier > Integer.MAX_VALUE / maxCount) multiplier = Integer.MAX_VALUE / maxCount;
+            maxMultiplier = multiplier;
+
+            while (minMultiplier != maxMultiplier) {
+                List<Ingredient> copied = new ArrayList<>();
+                for (final var ing : ingredients) {
+                    copied.add(ItemRecipeCapability.CAP.copyWithModifier(ing, ContentModifier.multiplier(multiplier)));
+                }
+                for (var handler : handlers) {
+                    // noinspection unchecked
+                    copied = (List<Ingredient>) handler.handleRecipe(IO.OUT, recipe, copied, true);
+                    if (copied == null) break;
+                }
+                int[] bin = ParallelLogic.adjustMultiplier(copied == null, minMultiplier, multiplier, maxMultiplier);
+                minMultiplier = bin[0];
+                multiplier = bin[1];
+                maxMultiplier = bin[2];
+            }
+            
+            return multiplier;
+        }
+
         OverlayedItemHandler itemHandler = new OverlayedItemHandler(new CombinedInvWrapper(
-                holder.getCapabilitiesFlat(IO.OUT, ItemRecipeCapability.CAP).stream()
+                handlers.stream()
                         .filter(IItemHandlerModifiable.class::isInstance)
                         .map(IItemHandlerModifiable.class::cast)
                         .toArray(IItemHandlerModifiable[]::new)));
 
         Object2IntMap<ItemStack> recipeOutputs = GTHashMaps
-                .fromItemStackCollection(recipe.getOutputContents(ItemRecipeCapability.CAP)
+                .fromItemStackCollection(outputContents
                         .stream()
                         .map(content -> ItemRecipeCapability.CAP.of(content.getContent()))
                         .filter(ingredient -> !ingredient.isEmpty())
@@ -290,17 +333,20 @@ public class ItemRecipeCapability extends RecipeCapability<Ingredient> {
 
     @Override
     public int getMaxParallelRatio(IRecipeCapabilityHolder holder, GTRecipe recipe, int parallelAmount) {
+        if (!holder.hasCapabilityProxies()) return 0;
         // Find all the items in the combined Item Input inventories and create oversized ItemStacks
-        List<Object2IntMap<ItemStack>> ingredientStacks = getIngredientStacks(holder);
+        List<Object2IntMap<ItemStack>> inventoryGroups = getInventoryGroups(holder);
+        if (inventoryGroups.isEmpty()) return 0;
 
         int minMultiplier = Integer.MAX_VALUE;
         // map the recipe ingredients to account for duplicated and notConsumable ingredients.
         // notConsumable ingredients are not counted towards the max ratio
         Object2IntOpenHashMap<Ingredient> notConsumableMap = new Object2IntOpenHashMap<>();
-        Object2IntOpenHashMap<Ingredient> countableMap = new Object2IntOpenHashMap<>();
+        Object2IntOpenHashMap<Ingredient> consumableMap = new Object2IntOpenHashMap<>();
         for (Content content : recipe.getInputContents(ItemRecipeCapability.CAP)) {
             Ingredient recipeIngredient = ItemRecipeCapability.CAP.of(content.content);
             int ingredientCount;
+            if (recipeIngredient instanceof IntCircuitIngredient) continue;
             if (recipeIngredient instanceof SizedIngredient sizedIngredient) {
                 ingredientCount = sizedIngredient.getAmount();
             } else if (recipeIngredient instanceof IntProviderIngredient intProviderIngredient) {
@@ -309,36 +355,32 @@ public class ItemRecipeCapability extends RecipeCapability<Ingredient> {
                 ingredientCount = 1;
             }
             if (content.chance == 0) {
-                notConsumableMap.mergeInt(recipeIngredient, ingredientCount, Integer::sum);
+                notConsumableMap.addTo(recipeIngredient, ingredientCount);
             } else {
-                countableMap.mergeInt(recipeIngredient, ingredientCount, Integer::sum);
+                consumableMap.addTo(recipeIngredient, ingredientCount);
             }
         }
 
         // is this even possible
-        if(countableMap.isEmpty() && notConsumableMap.isEmpty()) return parallelAmount;
+        if(consumableMap.isEmpty() && notConsumableMap.isEmpty()) return parallelAmount;
 
         int maxMultiplier = 0;
         // Check every inventory group
-        for (var inventory : ingredientStacks) {
+        for (var group : inventoryGroups) {
             // Check for enough NC in inventory group
             boolean satisfied = true;
-            for (var ncEntry : notConsumableMap.object2IntEntrySet()) {
-                Ingredient ingredient = ncEntry.getKey();
-                int needed = ncEntry.getIntValue();
-                for (var stackEntry : inventory.object2IntEntrySet()) {
+            for (var it = notConsumableMap.object2IntEntrySet().fastIterator(); it.hasNext(); ) {
+                var inputEntry = it.next();
+                Ingredient ingredient = inputEntry.getKey();
+                final int needed = inputEntry.getIntValue();
+                int available = 0;
+                for (var stackEntry : group.object2IntEntrySet()) {
                     if (ingredient.test(stackEntry.getKey())) {
-                        int count = stackEntry.getIntValue();
-                        if (count >= needed) {
-                            stackEntry.setValue(count - needed);
-                            needed = 0;
-                            break;
-                        }
-                        stackEntry.setValue(0);
-                        needed -= count;
+                        available += stackEntry.getIntValue();
+                        if (available >= needed) break;
                     }
                 }
-                if (needed > 0) {
+                if (available < needed) {
                     satisfied = false;
                     break;
                 }
@@ -346,17 +388,17 @@ public class ItemRecipeCapability extends RecipeCapability<Ingredient> {
             // Not enough NC -> skip this inventory
             if (!satisfied) continue;
             // Satisfied NC + no consumables -> early return
-            if (countableMap.isEmpty()) return parallelAmount;
+            if (consumableMap.isEmpty()) return parallelAmount;
 
             int invMultiplier = Integer.MAX_VALUE;
             // Loop over all consumables
-            for (var entry : countableMap.object2IntEntrySet()) {
-                Ingredient ingredient = entry.getKey();
-                final int needed = entry.getIntValue();
+            for (var inputEntry : consumableMap.object2IntEntrySet()) {
+                Ingredient ingredient = inputEntry.getKey();
+                final int needed = inputEntry.getIntValue();
                 final int maxNeeded = needed * parallelAmount;
                 int available = 0;
                 // Search stacks in our inventory group, summing them up
-                for (var stackEntry : inventory.object2IntEntrySet()) {
+                for (var stackEntry : group.object2IntEntrySet()) {
                     if (ingredient.test(stackEntry.getKey())) {
                         available += stackEntry.getIntValue();
                         // We can stop if we already have enough for max parallel
@@ -366,6 +408,8 @@ public class ItemRecipeCapability extends RecipeCapability<Ingredient> {
                 // ratio will equal 0 if available < needed
                 int ratio = Math.min(parallelAmount, available / needed);
                 invMultiplier = Math.min(invMultiplier, ratio);
+                // Not enough of this ingredient in this group -> skip inventory
+                if (ratio == 0) break;
             }
             // We found an inventory group that can do max parallel -> early return
             if (invMultiplier == parallelAmount) return parallelAmount;
@@ -433,38 +477,83 @@ public class ItemRecipeCapability extends RecipeCapability<Ingredient> {
 //        return minMultiplier;
     }
 
-    private List<Object2IntMap<ItemStack>> getIngredientStacks(IRecipeCapabilityHolder holder) {
-        var handlers = holder.getCapabilitiesFlat(IO.IN, ItemRecipeCapability.CAP);
+    private static List<Object2IntMap<ItemStack>> getInventoryGroups(IRecipeCapabilityHolder holder) {
+        var handlerLists = holder.getCapabilitiesForIO(IO.IN);
+        if (handlerLists.isEmpty()) return Collections.emptyList();
+        List<RecipeHandlerList> distinct = new ArrayList<>();
+        List<IRecipeHandler<?>> indistinct = new ArrayList<>();
 
-        List<Object2IntMap<ItemStack>> inventories = new ObjectArrayList<>();
-        Object2IntMap<ItemStack> combined = new Object2IntOpenCustomHashMap<>(ItemStackHashStrategy.comparingAllButCount());
-
-        for (IRecipeHandler<?> handler : handlers) {
-            Stream<ItemStack> stackStream = handler.getContents()
-                    .stream()
-                    .filter(ItemStack.class::isInstance)
-                    .map(ItemStack.class::cast);
-
-            if(handler.isDistinct()) {
-                var map = stackStream.collect(Collectors.toMap(
-                        Function.identity(),
-                        ItemStack::getCount,
-                        Integer::sum,
-                        () -> GTHashMaps.createItemStackMap(false))
-                );
-                if(!map.isEmpty()) inventories.add(map);
-            } else {
-                stackStream.forEach(stack -> combined.mergeInt(stack, stack.getCount(), Integer::sum));
+        for (var handlerList : handlerLists) {
+            if (handlerList.isDistinct() && handlerList.hasCapability(ItemRecipeCapability.CAP)) {
+                distinct.add(handlerList);
+            } else if(handlerList.hasCapability(ItemRecipeCapability.CAP)) {
+                indistinct.addAll(handlerList.getCapability(ItemRecipeCapability.CAP));
             }
         }
 
-        if(!combined.isEmpty()) {
-//            for (var inventory : inventories) {
-//                combined.forEach((stack, count) -> inventory.mergeInt(stack, count, Integer::sum));
-//            }
-            inventories.add(combined);
+        final var strat = ItemStackHashStrategy.comparingAllButCount();
+
+        List<Object2IntMap<ItemStack>> invs = new ArrayList<>(distinct.size() + 1);
+        Object2IntOpenCustomHashMap<ItemStack> combined = new Object2IntOpenCustomHashMap<>(strat);
+
+        for (var handler : indistinct) {
+            if (!handler.shouldSearchContent()) continue;
+            for (var content : handler.getContents()) {
+                if (content instanceof ItemStack stack && !stack.isEmpty()) {
+                    combined.addTo(stack, stack.getCount());
+                }
+            }
         }
-        return inventories;
+
+        for (var handlerList : distinct) {
+            var handlers = handlerList.getCapability(ItemRecipeCapability.CAP);
+            Object2IntOpenCustomHashMap<ItemStack> inventory = new Object2IntOpenCustomHashMap<>(combined, strat);
+            for (var handler : handlers) {
+                if (!handler.shouldSearchContent()) continue;
+                for (var content : handler.getContents()) {
+                    if (content instanceof ItemStack stack && !stack.isEmpty()) {
+                        inventory.addTo(stack, stack.getCount());
+                    }
+                }
+            }
+            invs.add(inventory);
+        }
+
+        if (!combined.isEmpty()) invs.add(combined);
+        return invs;
+
+
+//        var handlers = holder.getCapabilitiesFlat(IO.IN, ItemRecipeCapability.CAP);
+//
+//        List<Object2IntMap<ItemStack>> inventories = new ObjectArrayList<>();
+//        Object2IntMap<ItemStack> combined = new Object2IntOpenCustomHashMap<>(ItemStackHashStrategy.comparingAllButCount());
+//
+//        for (IRecipeHandler<?> handler : handlers) {
+//            Stream<ItemStack> stackStream = handler.getContents()
+//                    .stream()
+//                    .filter(ItemStack.class::isInstance)
+//                    .map(ItemStack.class::cast);
+//
+//            if(handler.isDistinct()) {
+//                var map = stackStream.collect(Collectors.toMap(
+//                        Function.identity(),
+//                        ItemStack::getCount,
+//                        Integer::sum,
+//                        () -> GTHashMaps.createItemStackMap(false))
+//                );
+//                if(!map.isEmpty()) inventories.add(map);
+//            } else {
+//                stackStream.forEach(stack -> combined.mergeInt(stack, stack.getCount(), Integer::sum));
+//            }
+//        }
+//
+//        if(!combined.isEmpty()) {
+////            for (var inventory : inventories) {
+////                combined.forEach((stack, count) -> inventory.mergeInt(stack, count, Integer::sum));
+////            }
+//            inventories.add(combined);
+//        }
+//        return inventories;
     }
 
     @Override

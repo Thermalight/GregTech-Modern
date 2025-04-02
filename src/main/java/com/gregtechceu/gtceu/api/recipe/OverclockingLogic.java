@@ -77,10 +77,10 @@ public interface OverclockingLogic {
         int maxParallels;
         if (!shouldParallel || this == PERFECT_OVERCLOCK || this == NON_PERFECT_OVERCLOCK) { // don't parallel
             maxParallels = 1;
-        } else if ((Math.pow(PERFECT_DURATION_FACTOR, OCs) * recipe.duration) > 1) {
-            maxParallels = 512; // if duration probably won't go below 1, give default overhead to save time
+        } else if ((Math.pow(PERFECT_DURATION_FACTOR, OCs) * recipe.duration) <= 1) {
+            maxParallels = 256; // if duration probably won't go below 1, give default overhead to save time
         } else {
-            maxParallels = ParallelLogic.getParallelAmount(machine, recipe, Integer.MAX_VALUE);
+            maxParallels = ParallelLogic.getParallelAmount(machine, recipe, 4096);
         }
 
         OCParams params = new OCParams(EUt, recipe.duration, OCs, maxParallels);

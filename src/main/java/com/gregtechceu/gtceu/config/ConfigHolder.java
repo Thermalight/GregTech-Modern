@@ -787,6 +787,8 @@ public class ConfigHolder {
         @Configurable
         @Configurable.Comment({ "Dump all registered GT models/blockstates/etc?", "Default: false" })
         public boolean dumpAssets = false;
+        @Configurable
+        public boolean parallelSwitch = true;
     }
 
     public static class RendererConfigs {
